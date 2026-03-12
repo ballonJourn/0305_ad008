@@ -108,7 +108,7 @@
 //	"1,2";	1024*768
 //	"2,8";	960*540
 //	"0,5";	1280*720
-#define MC_RESOLUTIONS_CONF_DATA "2,8"
+#define MC_RESOLUTIONS_CONF_DATA "1,2"
 
 // *.conf文件容易变成windows格式，行的结束符为\r\n，导致解析异常，改用代码动态去生成
 // hostapd.conf
@@ -160,11 +160,11 @@
 // 倒车轨迹线
 #define REVERSE_LINE_WIDTH       4    // 倒车线宽
 #define REVERSE_LINE_CORNER_LEN  50
-#define REVERSE_LINE_DEF_LTX     594  // 左上角x坐标 (1600*0.371≈594, 原1024下380)
+#define REVERSE_LINE_DEF_LTX     380  // 左上角x坐标
 #define REVERSE_LINE_DEF_LTY     220  // 左上角y坐标
 #define REVERSE_LINE_DEF_RTX     (SCREEN_WIDTH - REVERSE_LINE_DEF_LTX)  // 右上角x坐标
 #define REVERSE_LINE_DEF_RTY     REVERSE_LINE_DEF_LTY  // 右上角y坐标
-#define REVERSE_LINE_DEF_LBX     375  // 左下角x坐标 (1600*0.234≈375, 原1024下240)
+#define REVERSE_LINE_DEF_LBX     240  // 左下角x坐标
 #define REVERSE_LINE_DEF_LBY     SCREEN_HEIGHT  // 左下角y坐标
 #define REVERSE_LINE_DEF_RBX     (SCREEN_WIDTH - REVERSE_LINE_DEF_LBX) // 右下角x坐标
 #define REVERSE_LINE_DEF_RBY     REVERSE_LINE_DEF_LBY  // 右下角y坐标

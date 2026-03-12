@@ -1,4 +1,5 @@
-// new_f133_version2_mainLogic.cc
+// ad008_mainLogic.cc - Refactored version
+// Removed appSlideWindow, added dock window buttons with swipe-based page switching
 
 #pragma once
 #include "uart/ProtocolSender.h"
@@ -102,98 +103,315 @@ static std::string _last_play_file = "";      // 上次播放的文件
 static bool _background_resources_loaded = false; // 背景资源加载状态
 static bool _is_exiting_reverse = false;      // 标记是否正在从倒车模式退出
 
-// 当前页面索引
-static int _current_page_index = 0;
+// ============================================================================
+// 页面状态管理
+// 使用手指滑动距离判断翻页，不再依赖appSlideWindow控件
+// dock1Window, dock2Window, dock3Window 分别对应三个页面
+// ============================================================================
+static int _current_page_index = 0;  // 当前页面索引 (0, 1, 2)
 
 // ============================================================================
-// 滑动同步方案:
-//   appSlideWindow (ZKSlideWindow) 是图标网格, 用户手指直接拖动它;
-//   dockPageWindow (ZKPageWindow)  持有 dock1~dock3 三个子 Window,
-//     每个 dock 里放各页的文字标题控件。
-//
-//   【核心修正】用户滑动 appSlideWindow 时, 我们在 touch event 里
-//   同步移动 dockPageWindow 的位置, 让文字标题跟随图标一起平移。
-//   当翻页完成(onSlidePageChange)后再让 dockPageWindow 切到对应页。
-//
-//   文字控件本身不再做 setVisible 切换, 因为它们已经各自放在
-//   dock1/dock2/dock3 这三个子 Window 里, ZKPageWindow 的翻页
-//   天然会让对应子页可见、其他不可见。
+// 前向声明 - 按页设置dock按钮背景
 // ============================================================================
+static void set_dock_button_backgrounds_for_page(int page);
 
-// dockPageWindow 滑动跟随所需的状态
-static int _dock_slide_start_x = 0;       // 手指按下时的 X 坐标
-static bool _dock_is_sliding = false;      // 是否正在进行水平滑动
-static LayoutPosition _dock_origin_pos;    // dockPageWindow 初始位置(基准)
-static bool _dock_origin_saved = false;    // 是否已记录基准位置
+// ============================================================================
+// 切换dock窗口的显示
+// page: 0 - dock1Window, 1 - dock2Window, 2 - dock3Window
+// ============================================================================
+static void switch_dock_window(int page) {
+    if (page < 0) page = 0;
+    if (page > 2) page = 2;
 
-// 保存 dockPageWindow 的基准位置 (仅首次保存)
-static void saveDockOriginPos() {
-    if (!_dock_origin_saved && mdockPageWindowPtr) {
-        _dock_origin_pos = mdockPageWindowPtr->getPosition();
-        _dock_origin_saved = true;
-        LOGD("[main] saveDockOriginPos: left=%d, top=%d, w=%d, h=%d",
-             _dock_origin_pos.mLeft, _dock_origin_pos.mTop,
-             _dock_origin_pos.mWidth, _dock_origin_pos.mHeight);
+    _current_page_index = page;
+    LOGD("[main] switch_dock_window: page = %d", page);
+
+    // 更新RadioGroup状态
+    switch (page) {
+    case 0:
+        if (mStatusRadioGroupPtr) mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton0);
+        break;
+    case 1:
+        if (mStatusRadioGroupPtr) mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton1);
+        break;
+    case 2:
+        if (mStatusRadioGroupPtr) mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton2);
+        break;
+    }
+
+    // 显示/隐藏 dock 窗口
+    if (mdock1WindowPtr) {
+        if (page == 0) mdock1WindowPtr->showWnd();
+        else mdock1WindowPtr->hideWnd();
+    }
+    if (mdock2WindowPtr) {
+        if (page == 1) mdock2WindowPtr->showWnd();
+        else mdock2WindowPtr->hideWnd();
+    }
+    if (mdock3WindowPtr) {
+        if (page == 2) mdock3WindowPtr->showWnd();
+        else mdock3WindowPtr->hideWnd();
+    }
+
+    // 只加载当前页的按钮背景，释放其他页的，防止图片过多卡顿
+    set_dock_button_backgrounds_for_page(page);
+}
+
+// 根据滑动方向切换页面
+static void switch_page_by_direction(int delta_x) {
+    int new_page = _current_page_index;
+
+    if (delta_x < 0) {
+        // 向左滑动，切换到下一页
+        new_page = _current_page_index + 1;
+    } else if (delta_x > 0) {
+        // 向右滑动，切换到上一页
+        new_page = _current_page_index - 1;
+    }
+
+    // 边界检查
+    if (new_page < 0) new_page = 0;
+    if (new_page > 2) new_page = 2;
+
+    if (new_page != _current_page_index) {
+        switch_dock_window(new_page);
     }
 }
 
-// 将 dockPageWindow 切换到指定页面 (翻页完成后调用)
-static void syncDockPageWindow(int page) {
-    _current_page_index = page;
-    LOGD("[main] syncDockPageWindow: page = %d", page);
+// ============================================================================
+// 更新所有连接类按钮的状态文本 (Connected / Not connected)
+// ============================================================================
+static void update_link_status_text() {
+    LYLINK_TYPE_E link_type = lk::get_lylink_type();
 
-    if (mdockPageWindowPtr) {
-        // ZKPageWindow 的翻页由内部实现; 我们通过设置当前页索引来切换。
-        // 如果 ZKPageWindow 支持 turnToPage / setPageIndex, 直接调用;
-        // 否则我们用 position 偏移来模拟 (回弹到对齐位置)。
-        saveDockOriginPos();
+    // 更新CarPlay状态 - dock1Window下的CarPlayButton
+    if (mCarPlayButtonPtr) {
+        if ((link_type == LINK_TYPE_WIFICP) || (link_type == LINK_TYPE_USBCP)) {
+            mCarPlayButtonPtr->setText("Connected");
+        } else {
+            mCarPlayButtonPtr->setText("Not connected");
+        }
+    }
 
-        // 恢复到基准位置 (翻页完成, 不再有手指偏移)
-        // ZKPageWindow 内部自己管理子页的显隐, 我们只需要保证
-        // 整个 dockPageWindow 回到正确的原始位置即可。
-        mdockPageWindowPtr->setPosition(_dock_origin_pos);
+    // 更新AndroidAuto状态 - dock1Window下的AndroidAutoButton
+    if (mAndroidAutoButtonPtr) {
+        if ((link_type == LINK_TYPE_WIFIAUTO) || (link_type == LINK_TYPE_USBAUTO)) {
+            mAndroidAutoButtonPtr->setText("Connected");
+        } else {
+            mAndroidAutoButtonPtr->setText("Not connected");
+        }
+    }
+
+    // 更新Bluetooth状态 - dock1Window下的BluetoothButton
+    if (mBluetoothButtonPtr) {
+        if (bt::get_connect_state() == E_BT_CONNECT_STATE_CONNECTED) {
+            mBluetoothButtonPtr->setText("Connected");
+        } else {
+            mBluetoothButtonPtr->setText("Not connected");
+        }
+    }
+
+    // 更新AirPlay状态 - dock1Window下的AirPlayButton
+    if (mAirPlayButtonPtr) {
+        if (link_type == LINK_TYPE_AIRPLAY) {
+            mAirPlayButtonPtr->setText("Connected");
+        } else {
+            mAirPlayButtonPtr->setText("Not connected");
+        }
+    }
+
+    // 更新Miracast状态 - dock1Window下的MiracastButton
+    if (mMiracastButtonPtr) {
+        if (link_type == LINK_TYPE_MIRACAST) {
+            mMiracastButtonPtr->setText("Connected");
+        } else {
+            mMiracastButtonPtr->setText("Not connected");
+        }
+    }
+
+    // 更新AiCast状态 - dock2Window下的AicastButton
+    if (mAicastButtonPtr) {
+        if (link_type == LINK_TYPE_WIFILY) {
+            mAicastButtonPtr->setText("Connected");
+        } else {
+            mAicastButtonPtr->setText("Not connected");
+        }
     }
 }
 
-// 页面切换时更新控件可见性 (保留兼容; 由 ZKPageWindow 翻页机制驱动)
-static void updatePageVisibility(int page) {
-    _current_page_index = page;
-    LOGD("[main] updatePageVisibility: page = %d", page);
+// ============================================================================
+// dock1Window按钮的背景图片设置
+// ============================================================================
+static void set_dock1_button_backgrounds() {
+    if (mCarPlayButtonPtr) {
+        mCarPlayButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_carplay_n.png").c_str());
+    }
+    if (mAndroidAutoButtonPtr) {
+        mAndroidAutoButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_android_auto_n.png").c_str());
+    }
+    if (mBluetoothButtonPtr) {
+        mBluetoothButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_bt_n.png").c_str());
+    }
+    if (mAirPlayButtonPtr) {
+        mAirPlayButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_airplay_n.png").c_str());
+    }
+    if (mMiracastButtonPtr) {
+        mMiracastButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_miracast_n.png").c_str());
+    }
+}
 
-    // ---- dock1Window 里的控件 (page 0) ----
-    bool page1Visible = (page == 0);
-    if (mpage1BluetoothTextViewPtr)    mpage1BluetoothTextViewPtr->setVisible(page1Visible);
-    if (mpage1CarPlayTextViewPtr)      mpage1CarPlayTextViewPtr->setVisible(page1Visible);
-    if (mpage1AndroidAutoTextViewPtr)  mpage1AndroidAutoTextViewPtr->setVisible(page1Visible);
-    if (mpage1MiracastTextViewPtr)     mpage1MiracastTextViewPtr->setVisible(page1Visible);
-    if (mpage1AirPlayTextViewPtr)      mpage1AirPlayTextViewPtr->setVisible(page1Visible);
+// ============================================================================
+// dock2Window按钮的背景图片设置
+// ============================================================================
+static void set_dock2_button_backgrounds() {
+    if (mAicastButtonPtr) {
+        mAicastButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_aicast_n.png").c_str());
+    }
+    if (mMusicButtonPtr) {
+        mMusicButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_music_n.png").c_str());
+    }
+    if (mAudiooutButtonPtr) {
+        mAudiooutButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_audio_out_n.png").c_str());
+    }
+    if (mSettingsButtonPtr) {
+        mSettingsButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_set_n.png").c_str());
+    }
+    if (mvideoButtonPtr) {
+        mvideoButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_video_n.png").c_str());
+    }
+}
 
-    // ---- dock2Window 里的控件 (page 1) ----
-    bool page2Visible = (page == 1);
-    if (mmusicWindowPtr)               mmusicWindowPtr->setVisible(page2Visible);
-    if (mpage2AudiooutputTextViewPtr)  mpage2AudiooutputTextViewPtr->setVisible(page2Visible);
-    if (mpage2VideoTextViewPtr)        mpage2VideoTextViewPtr->setVisible(page2Visible);
-    if (mpage2AiCastTextViewPtr)       mpage2AiCastTextViewPtr->setVisible(page2Visible);
-    if (mmusictextPtr)                 mmusictextPtr->setVisible(page2Visible);
+// ============================================================================
+// dock3Window按钮的背景图片设置
+// 第三页只有一个PictureButton，其余4个位置用占位背景图填充
+// ============================================================================
+static void set_dock3_button_backgrounds() {
+    if (mPictureButtonPtr) {
+        mPictureButtonPtr->setBackgroundPic(
+            CONFIGMANAGER->getResFilePath("/HomePage/icon_picture_n.png").c_str());
+    }
+    // 占位背景: 补齐第三页空缺的4个按钮区域
+    bitmap_t *bmp = NULL;
+    if (mTextViewRightarea2Ptr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_9_rightarea2.jpg").c_str(), 3);
+        mTextViewRightarea2Ptr->setBackgroundPic(
+                CONFIGMANAGER->getResFilePath("/HomePage/crop_9_rightarea2.png").c_str());
+    }
+    if (mTextViewRightarea3Ptr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_10_rightarea3.jpg").c_str(), 3);
+        mTextViewRightarea3Ptr->setBackgroundPic(
+                CONFIGMANAGER->getResFilePath("/HomePage/crop_10_rightarea3.png").c_str());
+    }
+    if (mTextViewRightarea4Ptr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_11_rightarea4.jpg").c_str(), 3);
+        mTextViewRightarea4Ptr->setBackgroundPic(
+                CONFIGMANAGER->getResFilePath("/HomePage/crop_11_rightarea4.png").c_str());
+    }
+    if (mTextViewRightarea5Ptr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_12_rightarea5.jpg").c_str(), 3);
+        mTextViewRightarea5Ptr->setBackgroundPic(
+                CONFIGMANAGER->getResFilePath("/HomePage/crop_12_rightarea5.png").c_str());
+    }
+}
 
-    // ---- dock3Window 里的控件 (page 2) ----
-    bool page3Visible = (page == 2);
-    if (mpage3PictureTextViewPtr)      mpage3PictureTextViewPtr->setVisible(page3Visible);
+// ============================================================================
+// 释放各dock按钮的背景图片 (按页释放)
+// ============================================================================
+static void release_dock1_button_backgrounds() {
+    if (mCarPlayButtonPtr) mCarPlayButtonPtr->setBackgroundPic(NULL);
+    if (mAndroidAutoButtonPtr) mAndroidAutoButtonPtr->setBackgroundPic(NULL);
+    if (mBluetoothButtonPtr) mBluetoothButtonPtr->setBackgroundPic(NULL);
+    if (mAirPlayButtonPtr) mAirPlayButtonPtr->setBackgroundPic(NULL);
+    if (mMiracastButtonPtr) mMiracastButtonPtr->setBackgroundPic(NULL);
+}
 
-    // 同步 dockPageWindow 的位置, 确保不残留上一次的偏移
-    syncDockPageWindow(page);
+static void release_dock2_button_backgrounds() {
+    if (mAicastButtonPtr) mAicastButtonPtr->setBackgroundPic(NULL);
+    if (mMusicButtonPtr) mMusicButtonPtr->setBackgroundPic(NULL);
+    if (mAudiooutButtonPtr) mAudiooutButtonPtr->setBackgroundPic(NULL);
+    if (mSettingsButtonPtr) mSettingsButtonPtr->setBackgroundPic(NULL);
+    if (mvideoButtonPtr) mvideoButtonPtr->setBackgroundPic(NULL);
+}
+
+static void release_dock3_button_backgrounds() {
+    if (mPictureButtonPtr) mPictureButtonPtr->setBackgroundPic(NULL);
+    // 释放占位背景
+    if (mTextViewRightarea2Ptr) mTextViewRightarea2Ptr->setBackgroundPic(NULL);
+    if (mTextViewRightarea3Ptr) mTextViewRightarea3Ptr->setBackgroundPic(NULL);
+    if (mTextViewRightarea4Ptr) mTextViewRightarea4Ptr->setBackgroundPic(NULL);
+    if (mTextViewRightarea5Ptr) mTextViewRightarea5Ptr->setBackgroundPic(NULL);
+}
+
+// ============================================================================
+// 释放所有dock按钮的背景图片 (用于onUI_hide/onUI_quit全量释放)
+// ============================================================================
+static void release_dock_button_backgrounds() {
+    release_dock1_button_backgrounds();
+    release_dock2_button_backgrounds();
+    release_dock3_button_backgrounds();
+}
+
+// ============================================================================
+// 设置所有dock按钮的背景图片 (全量，用于初始化等场景)
+// ============================================================================
+static void set_all_dock_button_backgrounds() {
+    set_dock1_button_backgrounds();
+    set_dock2_button_backgrounds();
+    set_dock3_button_backgrounds();
+}
+
+// ============================================================================
+// 按页设置dock按钮背景: 只加载当前页，释放其他页，防止图片过多卡顿
+// ============================================================================
+static void set_dock_button_backgrounds_for_page(int page) {
+    switch (page) {
+    case 0:
+        set_dock1_button_backgrounds();
+        release_dock2_button_backgrounds();
+        release_dock3_button_backgrounds();
+        break;
+    case 1:
+        release_dock1_button_backgrounds();
+        set_dock2_button_backgrounds();
+        release_dock3_button_backgrounds();
+        break;
+    case 2:
+        release_dock1_button_backgrounds();
+        release_dock2_button_backgrounds();
+        set_dock3_button_backgrounds();
+        break;
+    default:
+        set_dock1_button_backgrounds();
+        release_dock2_button_backgrounds();
+        release_dock3_button_backgrounds();
+        break;
+    }
 }
 
 static void init_default_language() {
     std::string current_code = LANGUAGEMANAGER->getCurrentCode();
 
-    if (current_code.empty() || current_code == "zh_CN") {  // 当前语言代码为空、中文或系统首次启动的话就设置为英文
+    if (current_code.empty() || current_code == "zh_CN") {
         if (!FILE_EXIST("/data/.language_init_flag")) {
             LOGD("First boot detected, setting default language to English");
             sys::setting::update_localescode("en_US");
             system("touch /data/.language_init_flag");
             LOGD("Default language set to English (en_US)");
-        } else {  // 如果标志文件存在但语言仍是中文,不强制覆盖
+        } else {
             LOGD("Language init flag exists, current language: %s", current_code.c_str());
         }
     } else {
@@ -244,6 +462,8 @@ static void _lylink_callback(LYLINKAPI_EVENT evt, int para0, void *para1) {
 				media::music_pause();
 			}
 		}
+		// 更新连接状态文本
+		update_link_status_text();
 		break;
 	case LYLINK_LINK_DISCONN:
 		LOGD("LYLINK_LINK_DISCONN........... %s", lk::_link_type_to_str((LYLINK_TYPE_E) para0));
@@ -254,6 +474,8 @@ static void _lylink_callback(LYLINKAPI_EVENT evt, int para0, void *para1) {
 		}
 		bt::query_state();
 		EASYUICONTEXT->closeActivity("lylinkviewActivity");
+		// 更新连接状态文本
+		update_link_status_text();
 		break;
 	case LYLINK_PHONE_CONNECT:
 		LOGD("LYLINK_PHONE_CONNECT %s", lk::_link_type_to_str((LYLINK_TYPE_E) para0));
@@ -285,6 +507,8 @@ static void _lylink_callback(LYLINKAPI_EVENT evt, int para0, void *para1) {
 	case LYLINK_PHONE_DISCONN:
 		LOGD("LYLINK_PHONE_DISCONN............. %s", lk::_link_type_to_str((LYLINK_TYPE_E) para0));
 		lylinkapi_gocsdk("IA\r\n", strlen("IA\r\n"));
+		// 更新连接状态文本
+		update_link_status_text();
 		break;
 	default:
 		break;
@@ -424,6 +648,9 @@ static void _update_music_progress() {
 }
 
 static void _bt_music_cb(bt_music_state_e state) {
+	// 更新蓝牙连接状态文本
+	update_link_status_text();
+
 	if (bt::music_is_playing()) {
 		_update_music_info();
 		_update_music_progress();
@@ -519,6 +746,9 @@ static void _music_play_status_cb(music_play_status_e status) {
 }
 
 static void _bt_call_cb(bt_call_state_e state) {
+	// 更新蓝牙连接状态文本
+	update_link_status_text();
+
 	if (state != E_BT_CALL_STATE_IDLE) {
 		if (lk::get_lylink_type() == LINK_TYPE_WIFIAUTO) {
 			const char *app = EASYUICONTEXT->currentAppName();
@@ -566,67 +796,101 @@ static void ctrl_UI_init() {
 static void set_back_pic() {
 }
 
+// ============================================================================
+// 设置分片背景图片 (替代原来的单一 TextViewBg)
+// 8个控件分别对应8张裁剪后的背景图片
+// ============================================================================
+static void set_split_backgrounds() {
+    bitmap_t *bmp = NULL;
+
+    // 1. Top
+    if (mTextViewTopPtr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_1_top.jpg").c_str(), 3);
+        mTextViewTopPtr->setBackgroundBmp(bmp);
+    }
+
+    // 2. Bottom
+    if (mTextViewBottomPtr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_2_bottom.jpg").c_str(), 3);
+        mTextViewBottomPtr->setBackgroundBmp(bmp);
+    }
+
+    // 3. Left
+    if (mTextViewLeftPtr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_3_left.jpg").c_str(), 3);
+        mTextViewLeftPtr->setBackgroundPic(CONFIGMANAGER->getResFilePath("/HomePage/crop_3_left.png").c_str());
+    }
+
+    // 4. Divider1
+    if (mTextViewDivider1Ptr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_4_divider1.jpg").c_str(), 3);
+        mTextViewDivider1Ptr->setBackgroundBmp(bmp);
+    }
+
+    // 5. Divider2
+    if (mTextViewDivider2Ptr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_5_divider2.jpg").c_str(), 3);
+        mTextViewDivider2Ptr->setBackgroundBmp(bmp);
+    }
+
+    // 6. Divider3
+    if (mTextViewDivider3Ptr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_6_divider3.jpg").c_str(), 3);
+        mTextViewDivider3Ptr->setBackgroundBmp(bmp);
+    }
+
+    // 7. Divider4
+    if (mTextViewDivider4Ptr) {
+        bmp = NULL;
+        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_7_divider4.jpg").c_str(), 3);
+        mTextViewDivider4Ptr->setBackgroundBmp(bmp);
+    }
+
+    // 8. Right
+    if (mTextViewRightPtr) {
+        bmp = NULL;
+//        BitmapHelper::loadBitmapFromFile(bmp, CONFIGMANAGER->getResFilePath("/HomePage/crop_8_right.jpg").c_str(), 3);
+        mTextViewRightPtr->setBackgroundPic(CONFIGMANAGER->getResFilePath("/HomePage/crop_8_right.png").c_str());
+    }
+}
+
+// ============================================================================
+// 释放分片背景图片资源
+// ============================================================================
+static void release_split_backgrounds() {
+    if (mTextViewTopPtr) mTextViewTopPtr->setBackgroundBmp(NULL);
+    if (mTextViewBottomPtr) mTextViewBottomPtr->setBackgroundBmp(NULL);
+    if (mTextViewLeftPtr) mTextViewLeftPtr->setBackgroundBmp(NULL);
+    if (mTextViewDivider1Ptr) mTextViewDivider1Ptr->setBackgroundBmp(NULL);
+    if (mTextViewDivider2Ptr) mTextViewDivider2Ptr->setBackgroundBmp(NULL);
+    if (mTextViewDivider3Ptr) mTextViewDivider3Ptr->setBackgroundBmp(NULL);
+    if (mTextViewDivider4Ptr) mTextViewDivider4Ptr->setBackgroundBmp(NULL);
+    if (mTextViewRightPtr) mTextViewRightPtr->setBackgroundBmp(NULL);
+}
+
 // 更新所有控件的背景图片
 static void update_all_backgrounds_for_mode() {
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     LOGD("[main] update_all_backgrounds_for_mode() ENTER");
 
-    bitmap_t *bg_bmp = NULL;
+    // 1. 主背景 - 使用8个分片控件替代原来的单一 TextViewBg
+    LOGD("[main] Setting day mode split backgrounds");
+    set_split_backgrounds();
 
-    // 1. 主背景
-    BitmapHelper::loadBitmapFromFile(bg_bmp, CONFIGMANAGER->getResFilePath("/HomePage/carmain_home_wallpaper.jpg").c_str(), 3);
-    LOGD("[main] Setting day mode background");
-    if (mTextViewBgPtr) {
-        mTextViewBgPtr->setBackgroundBmp(bg_bmp);
-    }
-
-//    // 2. musicTextViewWindow - media_bg
-//    if (mmusicTextViewWindowPtr) {
-//        mmusicTextViewWindowPtr->setBackgroundPic(CONFIGMANAGER->getResFilePath("/HomePage/media_bg_n.png").c_str());
-//    }
-
-    // 3. music progress background
+    // 2. music progress background
     if (mPlayProgressSeekbarPtr && mTextView2Ptr) {
         mTextView2Ptr->setBackgroundPic(CONFIGMANAGER->getResFilePath("/HomePage/progress_n.png").c_str());
     }
 
-    // 4. 更新appSlideWindow的子项图片
-    if (mappSlideWindowPtr) {
-        // index 0: CarPlay
-        mappSlideWindowPtr->setItemStatusPic(0, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_carplay_n.png").c_str());
-        // index 1: Android Auto
-        mappSlideWindowPtr->setItemStatusPic(1, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_android_auto_n.png").c_str());
-        // index 2: Bluetooth
-        mappSlideWindowPtr->setItemStatusPic(2, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_bt_n.png").c_str());
-        // index 3: AirPlay
-        mappSlideWindowPtr->setItemStatusPic(3, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_airplay_n.png").c_str());
-        // index 4: Miracast
-        mappSlideWindowPtr->setItemStatusPic(4, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_miracast_n.png").c_str());
-        // index 5: AiCast (LyLink)
-        mappSlideWindowPtr->setItemStatusPic(5, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_aicast_n.png").c_str());
-        // index 6: Music
-        mappSlideWindowPtr->setItemStatusPic(6, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_music_n.png").c_str());
-        // index 7: FM
-        mappSlideWindowPtr->setItemStatusPic(7, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_audio_out_n.png").c_str());
-        // index 8: Settings
-        mappSlideWindowPtr->setItemStatusPic(8, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_set_n.png").c_str());
-        // index 9: Video
-        mappSlideWindowPtr->setItemStatusPic(9, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_video_n.png").c_str());
-        // index 10: Photo Album
-        mappSlideWindowPtr->setItemStatusPic(10, ZK_CONTROL_STATUS_NORMAL,
-            CONFIGMANAGER->getResFilePath("/HomePage/icon_picture_n.png").c_str());
-    }
+    // 3. 只设置当前页dock按钮的背景图片，防止图片过多卡顿
+    set_dock_button_backgrounds_for_page(_current_page_index);
 
     LOGD("[main] All backgrounds updated for day mode");
 
@@ -694,34 +958,6 @@ static void key_status(bool down) {
 	}
 }
 
-// AppSlideWindow翻页监听器 - 支持3页
-namespace {
-class AppSlidePageChangeListener : public ZKSlideWindow::ISlidePageChangeListener {
-protected:
-	virtual void onSlidePageChange(ZKSlideWindow *pSlideWindow, int page) {
-		LOGD("[main] AppSlidePageChangeListener: page changed to %d", page);
-		// 根据页面设置对应的RadioButton
-		switch (page) {
-		case 0:
-			mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton0);
-			break;
-		case 1:
-			mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton1);
-			break;
-		case 2:
-			mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton2);
-			break;
-		default:
-			mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton0);
-			break;
-		}
-		// 更新页面控件可见性
-		updatePageVisibility(page);
-	}
-};
-}
-static AppSlidePageChangeListener _s_app_slide_page_change_listener;
-
 static S_ACTIVITY_TIMEER REGISTER_ACTIVITY_TIMER_TAB[] = {
 	{1,  1000},
 	{QUERY_LINK_AUTH_TIMER, 6000},
@@ -741,8 +977,6 @@ static void onUI_init() {
     _cached_artist.clear();
     _last_play_file.clear();
     _current_page_index = 0;
-    _dock_is_sliding = false;
-    _dock_origin_saved = false;
 
 	sys::setting::init();
 	sys::hw::init();
@@ -772,24 +1006,17 @@ static void onUI_init() {
 	bt::query_state();
 
 	media::music_add_play_status_cb(_music_play_status_cb);
-//	if (mTextView1Ptr) {
-//		mTextView1Ptr->setTouchPass(true);
-//	}
 	if (martistTextViewPtr) {
 		martistTextViewPtr->setTouchPass(true);
 	}
 
-	// 设置appSlideWindow的翻页监听器
-	if (mappSlideWindowPtr) {
-		mappSlideWindowPtr->setSlidePageChangeListener(&_s_app_slide_page_change_listener);
+	// 初始化RadioGroup状态
+	if (mStatusRadioGroupPtr) {
+		mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton0);
 	}
-	mStatusRadioGroupPtr->setCheckedID(ID_MAIN_RadioButton0);
 
-	// 初始化 dockPageWindow 基准位置
-	saveDockOriginPos();
-
-	// 初始化页面可见性 - 默认显示第一页
-	updatePageVisibility(0);
+	// 初始化页面显示 - 默认显示第一页
+	switch_dock_window(0);
 
 	if(bt::is_calling()){
 		bt::call_vol(audio::get_lylink_call_vol());
@@ -813,7 +1040,7 @@ static void onUI_show() {
 
 	int curPos = -1;
 
-    // 更新所有背景(包括主背景和所有控件)
+    // 更新所有背景(包括分片主背景和所有控件)
     update_all_backgrounds_for_mode();
 
 	if (sys::setting::get_music_play_dev() == E_AUDIO_TYPE_BT_MUSIC) {
@@ -859,7 +1086,10 @@ static void onUI_show() {
 	}
 
 	// 恢复页面可见性状态
-	updatePageVisibility(_current_page_index);
+	switch_dock_window(_current_page_index);
+
+	// 更新CarPlay和AndroidAuto连接状态
+	update_link_status_text();
 }
 
 static void onUI_hide() {
@@ -870,15 +1100,15 @@ static void onUI_hide() {
 	LOGD("[main] onUI_hide - cleaning up resources");
 	_is_ui_update_paused = true;
 
-	if (mTextViewBgPtr) {
-		mTextViewBgPtr->setBackgroundBmp(NULL);
-	}
-//	if (mmusicTextViewWindowPtr) {
-//		mmusicTextViewWindowPtr->setBackgroundPic(NULL);
-//	}
+	// 释放分片背景资源
+	release_split_backgrounds();
+
 	if (mToMusicPtr) {
 		mToMusicPtr->setBackgroundPic(NULL);
 	}
+
+	// 释放dock按钮背景
+	release_dock_button_backgrounds();
 
 	_is_music_info_cached = false;
 	_cached_title.clear();
@@ -898,20 +1128,15 @@ static void onUI_quit() {
 		mPlayProgressSeekbarPtr->setSeekBarChangeListener(NULL);
 	}
 
-	// 移除appSlideWindow的翻页监听器
-	if (mappSlideWindowPtr) {
-		mappSlideWindowPtr->setSlidePageChangeListener(NULL);
-	}
+	// 释放分片背景资源
+	release_split_backgrounds();
 
-	if (mTextViewBgPtr) {
-		mTextViewBgPtr->setBackgroundBmp(NULL);
-	}
-//	if (mmusicTextViewWindowPtr) {
-//		mmusicTextViewWindowPtr->setBackgroundPic(NULL);
-//	}
 	if (mToMusicPtr) {
 		mToMusicPtr->setBackgroundPic(NULL);
 	}
+
+	// 释放dock按钮背景
+	release_dock_button_backgrounds();
 
 	_is_music_info_cached = false;
 	_cached_title.clear();
@@ -1036,63 +1261,66 @@ static bool isTouchInSeekBarArea(int x, int y) {
 	return false;
 }
 
+// ============================================================================
+// 触摸事件处理 - 使用手指移动距离判断翻页
+// ============================================================================
 static bool onmainActivityTouchEvent(const MotionEvent &ev) {
 	LayoutPosition pos = EASYUICONTEXT->getNaviBar()->getPosition();
 
 	static MotionEvent down_ev;
 	static bool allow_switch;
+	static bool is_seekbar_touch;  // 标记是否在SeekBar区域触摸
 
-	if (pos.mTop != -pos.mHeight) {	return false; }
+	if (pos.mTop != -pos.mHeight) { return false; }
 
-	// ================================================================
-	// 在 appSlideWindow 滑动期间, 同步平移 dockPageWindow,
-	// 让文字标题控件跟随图标一起运动, 消除"卡在原地"的视觉问题。
-	// ================================================================
 	switch (ev.mActionStatus) {
 	case MotionEvent::E_ACTION_DOWN:
-		if (app::is_hit_floatwnd(ev.mX, ev.mY))	{
+		// 检查触摸起始点是否在SeekBar区域
+		is_seekbar_touch = isTouchInSeekBarArea(ev.mX, ev.mY);
+		if (is_seekbar_touch) {
+			// 如果在SeekBar区域，不允许切换窗口
+			allow_switch = false;
+			LOGD("[main] Touch started in SeekBar area, disable window switch");
+		} else {
 			allow_switch = true;
-			down_ev = ev;
 		}
-		// 记录手指起始位置, 并保存 dockPageWindow 基准坐标
-		_dock_slide_start_x = ev.mX;
-		_dock_is_sliding = false;
-		saveDockOriginPos();
+		down_ev = ev;
 		break;
-
-	case MotionEvent::E_ACTION_MOVE: {
-		// 计算手指横向偏移量
-		int deltaX = ev.mX - _dock_slide_start_x;
-
-		// 阈值判断: 超过 10px 认为是水平滑动
-		if (!_dock_is_sliding && (deltaX > 10 || deltaX < -10)) {
-			// 检查是否在 SeekBar 区域内, 如果是则不处理滑动
-			if (isTouchInSeekBarArea(down_ev.mX, down_ev.mY)) {
-				break;
-			}
-			_dock_is_sliding = true;
-		}
-
-		if (_dock_is_sliding && mdockPageWindowPtr && _dock_origin_saved) {
-			// 按手指偏移量平移 dockPageWindow
-			LayoutPosition newPos = _dock_origin_pos;
-			newPos.mLeft = _dock_origin_pos.mLeft + deltaX;
-			mdockPageWindowPtr->setPosition(newPos);
+	case MotionEvent::E_ACTION_MOVE:
+		// 如果正在SeekBar区域操作，继续禁止窗口切换
+		if (is_seekbar_touch) {
+			allow_switch = false;
 		}
 		break;
-	}
+	case MotionEvent::E_ACTION_UP:
+		// 滑动距离阈值: SCREEN_WIDTH / 10 (约160像素)
+	    if (allow_switch && !is_seekbar_touch && (abs(ev.mX - down_ev.mX) >= SCREEN_WIDTH / 10)) {
+	        int delta_x = ev.mX - down_ev.mX;
+	        LOGD("[main] Swipe detected, delta_x = %d, current_page = %d", delta_x, _current_page_index);
 
-	case MotionEvent::E_ACTION_UP: {
-		if (_dock_is_sliding && mdockPageWindowPtr && _dock_origin_saved) {
-			// 松手后, 恢复 dockPageWindow 到基准位置
-			// 实际翻页由 AppSlidePageChangeListener::onSlidePageChange 触发,
-			// 那里会调用 updatePageVisibility -> syncDockPageWindow 完成最终对齐。
-			mdockPageWindowPtr->setPosition(_dock_origin_pos);
-		}
-		_dock_is_sliding = false;
+	        // 边界检查: 防止在边界页面进行无效滑动
+	        bool allow_change = true;
+	        if (_current_page_index == 0 && delta_x > 0) {
+	            // 第一页向右滑动无效
+	            allow_change = false;
+	            LOGD("[main] Already at first page, cannot swipe right");
+	        } else if (_current_page_index == 2 && delta_x < 0) {
+	            // 最后一页向左滑动无效
+	            allow_change = false;
+	            LOGD("[main] Already at last page, cannot swipe left");
+	        }
+
+	        if (allow_change) {
+	            switch_page_by_direction(delta_x);
+	        }
+	    } else {
+	        LOGD("[main] Swipe not triggered: allow_switch=%d, is_seekbar_touch=%d, distance=%d, threshold=%d",
+	             allow_switch, is_seekbar_touch, abs(ev.mX - down_ev.mX), SCREEN_WIDTH / 10);
+	    }
+
+	    allow_switch = false;
+	    is_seekbar_touch = false;  // 重置SeekBar触摸标记
 		break;
-	}
-
 	default:
 		break;
 	}
@@ -1304,13 +1532,8 @@ static void onCheckedChanged_StatusRadioGroup(ZKRadioGroup* pRadioGroup, int che
         break;
     }
 
-    // 切换SlideWindow到对应页面
-//    if (mappSlideWindowPtr) {
-//        mappSlideWindowPtr->turnToPage(page);
-//    }
-
-    // 更新页面控件可见性
-    updatePageVisibility(page);
+    // 切换到对应页面
+    switch_dock_window(page);
 }
 
 static void onProgressChanged_PlayVolSeekBar(ZKSeekBar *pSeekBar, int progress) {
@@ -1343,84 +1566,107 @@ static bool onButtonClick_toLocalmusicButton(ZKButton *pButton) {
 		return false;
 	}
     // 只有当音源为本地音乐时才跳转到musicActivity
-    if (sys::setting::get_music_play_dev() == E_AUDIO_TYPE_MUSIC) {
+    if (sys::setting::get_music_play_dev() == E_AUDIO_TYPE_MUSIC || bt::get_connect_state() != E_BT_CONNECT_STATE_CONNECTED) {
         EASYUICONTEXT->openActivity("musicActivity");
     }
     return false;
 }
 
-static void onSlideItemClick_appSlideWindow(ZKSlideWindow *pSlideWindow, int index) {
-    LOGD(" onSlideItemClick_ appSlideWindow %d !!!\n", index);
-    switch(index) {
-    case 0:  // CarPlay
-        LOGD(" ButtonClick CPButton !!!\n");
-        open_link_activity(E_LINK_MODE_CARPLAY);
-        break;
-    case 1:  // Android Auto
-        LOGD(" ButtonClick AAButton !!!\n");
-        open_link_activity(E_LINK_MODE_ANDROIDAUTO);
-        break;
-    case 3:  // AirPlay
-        LOGD(" ButtonClick APButton !!!\n");
-        open_link_activity(E_LINK_MODE_AIRPLAY);
-        break;
-    case 5:  // AiCast (LyLink)
-        LOGD(" ButtonClick ACButton !!!\n");
-        open_link_activity(E_LINK_MODE_LYLINK);
-        break;
-    case 4:  // Miracast
-        LOGD(" ButtonClick MCButton !!!\n");
-        open_link_activity(E_LINK_MODE_MIRACAST);
-        break;
-    case 2:  // Bluetooth
-        LOGD(" ButtonClick BtMusicButton !!!\n");
-        if (lk::is_connected()) {
-            if (mlinkTipsWindowPtr) {
-                mlinkTipsWindowPtr->showWnd();
-            }
-            break;
+// ============================================================================
+// dock1Window 按钮点击事件
+// ============================================================================
+static bool onButtonClick_CarPlayButton(ZKButton *pButton) {
+    LOGD(" ButtonClick CarPlayButton !!!\n");
+    open_link_activity(E_LINK_MODE_CARPLAY);
+    return false;
+}
+
+static bool onButtonClick_AndroidAutoButton(ZKButton *pButton) {
+    LOGD(" ButtonClick AndroidAutoButton !!!\n");
+    open_link_activity(E_LINK_MODE_ANDROIDAUTO);
+    return false;
+}
+
+static bool onButtonClick_BluetoothButton(ZKButton *pButton) {
+    LOGD(" ButtonClick BluetoothButton !!!\n");
+    if (lk::is_connected()) {
+        if (mlinkTipsWindowPtr) {
+            mlinkTipsWindowPtr->showWnd();
         }
-        EASYUICONTEXT->openActivity("btsettingActivity");
-        break;
-    case 6:  // Music
-        LOGD(" ButtonClick MusicButton !!!\n");
-        if (lk::is_connected()) {
-            if (mlinkTipsWindowPtr) {
-                mlinkTipsWindowPtr->showWnd();
-            }
-            break;
-        }
-        EASYUICONTEXT->openActivity("musicActivity");
-        break;
-    case 9:  // Video
-        LOGD(" ButtonClick VideoButton !!!\n");
-        if (lk::is_connected()) {
-            if (mlinkTipsWindowPtr) {
-                mlinkTipsWindowPtr->showWnd();
-            }
-            break;
-        }
-        EASYUICONTEXT->openActivity("videoActivity");
-        break;
-    case 10:  // Photo Album
-        LOGD(" ButtonClick PhotoAlbum !!!\n");
-        if (lk::is_connected()) {
-            if (mlinkTipsWindowPtr) {
-                mlinkTipsWindowPtr->showWnd();
-            }
-            break;
-        }
-        EASYUICONTEXT->openActivity("PhotoAlbumActivity");
-        break;
-    case 8:  // Settings
-        LOGD(" ButtonClick setting !!!\n");
-        EASYUICONTEXT->openActivity("setshowActivity");
-        break;
-    case 7:  // FM
-        LOGD(" ButtonClick FM !!!\n");
-        EASYUICONTEXT->openActivity("FMemitActivity");
-        break;
-    default:
-        break;
+        return false;
     }
+    EASYUICONTEXT->openActivity("btsettingActivity");
+    return false;
+}
+
+static bool onButtonClick_AirPlayButton(ZKButton *pButton) {
+    LOGD(" ButtonClick AirPlayButton !!!\n");
+    open_link_activity(E_LINK_MODE_AIRPLAY);
+    return false;
+}
+
+static bool onButtonClick_MiracastButton(ZKButton *pButton) {
+    LOGD(" ButtonClick MiracastButton !!!\n");
+    open_link_activity(E_LINK_MODE_MIRACAST);
+    return false;
+}
+
+// ============================================================================
+// dock2Window 按钮点击事件
+// ============================================================================
+static bool onButtonClick_AicastButton(ZKButton *pButton) {
+    LOGD(" ButtonClick AicastButton !!!\n");
+    open_link_activity(E_LINK_MODE_LYLINK);
+    return false;
+}
+
+static bool onButtonClick_MusicButton(ZKButton *pButton) {
+    LOGD(" ButtonClick MusicButton !!!\n");
+    if (lk::is_connected()) {
+        if (mlinkTipsWindowPtr) {
+            mlinkTipsWindowPtr->showWnd();
+        }
+        return false;
+    }
+    EASYUICONTEXT->openActivity("musicActivity");
+    return false;
+}
+
+static bool onButtonClick_AudiooutButton(ZKButton *pButton) {
+    LOGD(" ButtonClick AudiooutButton !!!\n");
+    EASYUICONTEXT->openActivity("FMemitActivity");
+    return false;
+}
+
+static bool onButtonClick_SettingsButton(ZKButton *pButton) {
+    LOGD(" ButtonClick SettingsButton !!!\n");
+    EASYUICONTEXT->openActivity("setshowActivity");
+    return false;
+}
+
+static bool onButtonClick_videoButton(ZKButton *pButton) {
+    LOGD(" ButtonClick videoButton !!!\n");
+    if (lk::is_connected()) {
+        if (mlinkTipsWindowPtr) {
+            mlinkTipsWindowPtr->showWnd();
+        }
+        return false;
+    }
+    EASYUICONTEXT->openActivity("videoActivity");
+    return false;
+}
+
+// ============================================================================
+// dock3Window 按钮点击事件
+// ============================================================================
+static bool onButtonClick_PictureButton(ZKButton *pButton) {
+    LOGD(" ButtonClick PictureButton !!!\n");
+    if (lk::is_connected()) {
+        if (mlinkTipsWindowPtr) {
+            mlinkTipsWindowPtr->showWnd();
+        }
+        return false;
+    }
+    EASYUICONTEXT->openActivity("PhotoAlbumActivity");
+    return false;
 }
